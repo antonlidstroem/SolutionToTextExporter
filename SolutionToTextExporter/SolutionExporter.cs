@@ -35,7 +35,6 @@ namespace SolutionToTextExporter
             foreach (var file in files)
             {
                 string content;
-
                 try
                 {
                     content = File.ReadAllText(file);
@@ -103,20 +102,29 @@ namespace SolutionToTextExporter
                 "bin", "obj", "node_modules", "dist", "build",
                 "public", "packages", "venv", "__pycache__",
                 ".git", ".vs", ".idea", ".gradle", "target",
-                "coverage"
+                "coverage", "Migrations"
             };
 
             var relative = Path.GetRelativePath(_solutionFolder, file);
             var parts = relative.Split(Path.DirectorySeparatorChar);
 
-            if (parts.Any(p => excludedDirs.Contains(p)))
+            // Ignorera kataloger som matchar excludedDirs
+            if (parts.Any(p => excludedDirs.Contains(p, StringComparer.OrdinalIgnoreCase)))
                 return false;
 
+            // Filtypkontroll
             if (!allowedExtensions.Any(ext =>
                     file.EndsWith(ext, StringComparison.OrdinalIgnoreCase)))
                 return false;
 
-            if (relative.Contains("lock"))
+            // Ignorera lås- och backupfiler
+            if (relative.Contains("lock", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // Ignorera designer-filer och EF snapshot/migrations
+            string fileName = Path.GetFileName(file);
+            if (Regex.IsMatch(fileName, @"(ModelSnapshot|Migration\.Designer\.cs|.*designer\.cs|BudgetDbContextModelSnapshot\.cs)$",
+                              RegexOptions.IgnoreCase))
                 return false;
 
             return true;
