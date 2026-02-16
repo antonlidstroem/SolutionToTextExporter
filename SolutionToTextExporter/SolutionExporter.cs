@@ -1,18 +1,20 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace SolutionToTextExporter
 {
     public class SolutionExporter
     {
         private readonly string _solutionFolder;
-        private readonly int _chunkSizeBytes;
+        private const int MaxChunkSizeBytes = 40 * 1024; // 40 KB (AI-safe)
 
-        public SolutionExporter(string solutionFolder, int chunkSizeBytes = 1 * 1024 * 1024)
+        public SolutionExporter(string solutionFolder)
         {
-            _solutionFolder = solutionFolder ?? throw new ArgumentNullException(nameof(solutionFolder));
-            _chunkSizeBytes = chunkSizeBytes;
+            _solutionFolder = solutionFolder
+                ?? throw new ArgumentNullException(nameof(solutionFolder));
         }
 
         public void Export()
@@ -20,48 +22,139 @@ namespace SolutionToTextExporter
             string outputFolder = Path.Combine(_solutionFolder, "SolutionTextChunks");
             Directory.CreateDirectory(outputFolder);
 
-            StringBuilder buffer = new StringBuilder();
             int chunkIndex = 0;
+            var buffer = new StringBuilder();
+            int bufferBytes = 0;
 
-            // Endelser som är intressanta för AI/felsökning
-            string[] extensions = { ".cs", ".xaml", ".csproj", ".config", ".json" };
+            var files = Directory
+                .EnumerateFiles(_solutionFolder, "*.*", SearchOption.AllDirectories)
+                .Where(IsRelevantFile)
+                .OrderBy(f => f)
+                .ToList();
 
-            // Mappar vi vill ignorera
-            string[] excludedDirs = { "bin", "obj", ".vs", "packages" };
-
-            foreach (string file in Directory.EnumerateFiles(_solutionFolder, "*.*", SearchOption.AllDirectories))
+            foreach (var file in files)
             {
-                // Hoppa över filer i exkluderade mappar
-                if (Array.Exists(excludedDirs, dir => file.Contains(Path.DirectorySeparatorChar + dir + Path.DirectorySeparatorChar)))
-                    continue;
+                string content;
 
-                // Hoppa över filer som inte är av rätt typ
-                if (!Array.Exists(extensions, ext => ext.Equals(Path.GetExtension(file), StringComparison.OrdinalIgnoreCase)))
-                    continue;
-
-                buffer.AppendLine($"\n==== {file} ====\n");
-                buffer.AppendLine(File.ReadAllText(file));
-
-                // Skriv till fil om buffer > chunkSize
-                if (Encoding.UTF8.GetByteCount(buffer.ToString()) >= _chunkSizeBytes)
+                try
                 {
-                    string chunkPath = Path.Combine(outputFolder, $"chunk_{chunkIndex}.txt");
-                    File.WriteAllText(chunkPath, buffer.ToString());
-                    Console.WriteLine($"Skriver {chunkPath}");
-                    buffer.Clear();
-                    chunkIndex++;
+                    content = File.ReadAllText(file);
                 }
+                catch
+                {
+                    continue;
+                }
+
+                content = CleanForAI(content);
+
+                if (string.IsNullOrWhiteSpace(content))
+                    continue;
+
+                string relative = Path.GetRelativePath(_solutionFolder, file);
+                string block = $"==== {relative} ====\n{content}\n";
+
+                int blockBytes = Encoding.UTF8.GetByteCount(block);
+
+                if (blockBytes > MaxChunkSizeBytes)
+                {
+                    Flush(ref buffer, ref bufferBytes, outputFolder, ref chunkIndex);
+                    SplitLargeBlock(block, outputFolder, ref chunkIndex);
+                    continue;
+                }
+
+                if (bufferBytes + blockBytes > MaxChunkSizeBytes)
+                {
+                    Flush(ref buffer, ref bufferBytes, outputFolder, ref chunkIndex);
+                }
+
+                buffer.Append(block);
+                bufferBytes += blockBytes;
             }
 
-            // Skriv sista chunken
-            if (buffer.Length > 0)
+            Flush(ref buffer, ref bufferBytes, outputFolder, ref chunkIndex);
+
+            Console.WriteLine($"Klar. Skapade {chunkIndex} chunk-filer.");
+        }
+
+        private string CleanForAI(string content)
+        {
+            // Ta bort block-kommentarer
+            content = Regex.Replace(content, @"/\*.*?\*/", "", RegexOptions.Singleline);
+
+            // Ta bort enkelradskommentarer
+            content = Regex.Replace(content, @"//.*", "");
+
+            // Ta bort extra tomrader
+            content = Regex.Replace(content, @"^\s*$\n|\r", "", RegexOptions.Multiline);
+
+            return content.Trim();
+        }
+
+        private bool IsRelevantFile(string file)
+        {
+            string[] allowedExtensions = {
+                ".cs", ".java", ".kt", ".py",
+                ".vue", ".js", ".ts", ".jsx", ".tsx",
+                ".html", ".css", ".scss",
+                ".csproj", ".json", ".yml", ".yaml"
+            };
+
+            string[] excludedDirs = {
+                "bin", "obj", "node_modules", "dist", "build",
+                "public", "packages", "venv", "__pycache__",
+                ".git", ".vs", ".idea", ".gradle", "target",
+                "coverage"
+            };
+
+            var relative = Path.GetRelativePath(_solutionFolder, file);
+            var parts = relative.Split(Path.DirectorySeparatorChar);
+
+            if (parts.Any(p => excludedDirs.Contains(p)))
+                return false;
+
+            if (!allowedExtensions.Any(ext =>
+                    file.EndsWith(ext, StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            if (relative.Contains("lock"))
+                return false;
+
+            return true;
+        }
+
+        private void Flush(ref StringBuilder buffer,
+                           ref int bufferBytes,
+                           string folder,
+                           ref int index)
+        {
+            if (bufferBytes == 0)
+                return;
+
+            string path = Path.Combine(folder, $"chunk_{index}.txt");
+            File.WriteAllText(path, buffer.ToString());
+
+            buffer.Clear();
+            bufferBytes = 0;
+            index++;
+        }
+
+        private void SplitLargeBlock(string block,
+                                     string folder,
+                                     ref int index)
+        {
+            int start = 0;
+
+            while (start < block.Length)
             {
-                string chunkPath = Path.Combine(outputFolder, $"chunk_{chunkIndex}.txt");
-                File.WriteAllText(chunkPath, buffer.ToString());
-                Console.WriteLine($"Skriver {chunkPath}");
-            }
+                int length = Math.Min(block.Length - start, MaxChunkSizeBytes);
+                string chunk = block.Substring(start, length);
 
-            Console.WriteLine("Klar!");
+                string path = Path.Combine(folder, $"chunk_{index}.txt");
+                File.WriteAllText(path, chunk);
+
+                start += length;
+                index++;
+            }
         }
     }
 }
